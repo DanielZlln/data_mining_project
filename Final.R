@@ -11,6 +11,8 @@
 
 # library laden
 library(lattice)
+library(glmnet)
+library(vip)
 library(caret)
 library(dplyr)
 library(DataExplorer)
@@ -85,11 +87,6 @@ heart_disease %>%
   group_by(Einkommen) %>% 
   summarise(anzahl = n())
 
-# heart_disease <- heart_disease %>% 
-#   mutate(Einkommen = str_remove(string = Einkommen, pattern = '\\<'),
-#          Einkommen = str_remove(string = Einkommen, pattern = '\\>'),
-#          Einkommen = str_remove(string = Einkommen, pattern = '\\ '))
-
 str(heart_disease)
 
 heart_disease %>% 
@@ -160,31 +157,6 @@ table(Gesundheit = heart_disease$Allg_Gesundheit,
 
 # ------------------------------------------------------------------------
 
-# Create recipe
-heart_recipe_down <- 
-  recipe(Herzinfarkt ~., data = heart_train) %>% 
-  step_downsample(Herzinfarkt, under_ratio = 3) %>%
-  step_normalize(all_numeric_predictors())
-
-heart_recipe_up <-
-  recipe(Herzinfarkt ~., 
-         data = heart_disease) %>%
-  step_smotenc(Herzinfarkt, 
-               over_ratio = 1) %>% 
-  step_normalize(all_nominal_predictors())
-
-# Create second recipe with dummy 
-heart_recipe_down_num <- heart_recipe_down %>% 
-  step_dummy(all_nominal_predictors(), one_hot = TRUE)
-
-heart_recipe_up_num <- heart_recipe_up %>% 
-  step_dummy(all_nominal_predictors(), 
-             one_hot = TRUE)
-
-recipes <- list(lr_recipe = heart_recipe_down)
-                #dt_recipe = heart_recipe_down,
-                #rf_recipe = heart_recipe_down,
-                #xgb_recipe = heart_recipe_down_num)
 
 # Datensatz aufteilen zwischen test und train
 set.seed(123)
@@ -210,6 +182,35 @@ heart_test %>%
   count(Herzinfarkt) %>% 
   mutate(prop = n/sum(n))
 
+
+
+# Create recipe
+heart_recipe_down <- 
+  recipe(Herzinfarkt ~., data = heart_train) %>% 
+  step_downsample(Herzinfarkt, under_ratio = 3) %>%
+  step_normalize(all_numeric_predictors())
+
+# heart_recipe_up <-
+#   recipe(Herzinfarkt ~., 
+#          data = heart_train) %>%
+#   step_smotenc(Herzinfarkt, 
+#                over_ratio = 1) %>% 
+#   step_normalize(all_nominal_predictors())
+
+# Create second recipe with dummy 
+heart_recipe_down_num <- heart_recipe_down %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# heart_recipe_up_num <- heart_recipe_up %>% 
+#   step_dummy(all_nominal_predictors(), 
+#              one_hot = TRUE)
+
+recipes <- list(lr_recipe = heart_recipe_down)
+                #lr_tune_recipe = heart_recipe_down_num)
+                #dt_recipe = heart_recipe_down)
+                #rf_recipe = heart_recipe_down,
+                #xgb_recipe = heart_recipe_down_num)
+
 # Resampling
 # ------------------------------------------------------------------------------
 
@@ -229,6 +230,13 @@ lr_model <-
   logistic_reg(mode = "classification", 
                engine = "glm")
 
+# Logistic tune, keine verbesserung!
+lr_mode_tune <- 
+  logistic_reg(engine = "glmnet", 
+               mode = "classification",
+               penalty = tune(),
+               mixture = tune())
+
 # Decision Tree
 dt_model <- 
   decision_tree(mode = "classification",
@@ -243,7 +251,7 @@ rf_model <-
               engine = "ranger",
               trees = tune(),
               min_n = tune())
-              #mtry = tune())
+              #mtry = tune()) wird nicht erkannt
 
 # XGBoost
 xgb_model <- 
@@ -262,8 +270,9 @@ xgb_model <-
 
 # List of models
 models <- list(lr_model = lr_model)
+               #lr_model_tune = lr_mode_tune)
                #dt_model = dt_model,
-               #rf_model = rf_model,
+               #rf_model = rf_model)
                #xgb_model = xgb_model)
 
 # Create workflow set
@@ -285,22 +294,52 @@ heart_fit <- heart_workflows %>%
                control = control_resamples(save_pred = TRUE,
                                            parallel_over = "everything",
                                            save_workflow = TRUE))
-show_notes(.Last.tune.result)
-check_type()
+
+
 # Logistic is the best one
 
-# tune the glm, but same roc_auc result
-#
-# library(glmnet)
-# install.packages("glmnet")
-# mod <- logistic_reg(engine = "glmnet", 
-#                     mode = "classification",
-#                     penalty = tune(),
-#                     mixture = tune())
+lr_form_fit <- 
+  lr_model %>% 
+  fit(Herzinfarkt~., data = heart_train)
+
+lr_form_fit %>% extract_fit_engine() %>% summary()
+
+# Overfitting = zu komplexes Modell
+# die optimale Modellkomplexität finden
+
+# Speichern Vorhersagen Trainingsdaten
+pred_train <-
+  heart_train %>% select(Herzinfarkt) %>%
+  bind_cols(predicted = predict(lr_form_fit,
+                                new_data = heart_train,
+                                type = "prob")) %>%
+  mutate(dataset = "train")
+
+# Speichern Vorhersagen Testdaten
+pred_test <-
+  heart_test %>% select(Herzinfarkt) %>%
+  bind_cols(predicted = predict(lr_form_fit,
+                                new_data = heart_test,
+                                type = "prob")) %>%
+  mutate(dataset = "test")
+
+# Kombinieren von Test- und Trainingsdaten
+pred <- bind_rows(pred_train, pred_test)
+
+# Plot beide ROCs in einer Abbildung
+pred %>%
+  group_by(dataset) %>%
+  roc_curve(truth = Herzinfarkt, estimate = `.pred_Infarkt`) %>%
+  autoplot()
+
+
+# falls die Kurven stark voneinander abweichen, muss man von overfitting 
+# ausgehen - hier weichen die Kurven nicht voneinander ab
 
 # Evaluation
 # ------------------------------------------------------------------------------
 collection <- collect_metrics(heart_fit, summarize = F)
+collection
 
 #
 autoplot(heart_fit,
@@ -330,34 +369,13 @@ best_test_results <-
 best_test_results %>% 
   collect_metrics()
 
+
+
 # Prediction
 
 best_test_results$.predictions
 # 
 # # ------------------------------------------------------------------------------
-# # workflow
-# heart_wflow_down <- 
-#   workflow() %>% 
-#   add_model(dt_model) %>% 
-#   add_recipe(heart_recipe_down)
-# 
-# # heart_wflow_up <- 
-# #   workflow() %>% 
-# #   add_model(dt_model) %>% 
-# #   add_recipe(heart_recipe_up)
-# 
-# # show workflow
-# heart_wflow_down
-# heart_wflow_up
-# #####
-# 
-# hf_collected_metrics <- heart_fit %>% collect_metrics() %>% print(n=100)
-# 
-# hf_acc <- heart_fit %>% collect_metrics() %>% filter(.metric == "accuracy") %>% print(n=50)
-# hf_rocauc <- heart_fit %>% collect_metrics() %>% filter(.metric == "roc_auc") %>% print(n=50)
-# 
-# 
-
 
 ### Prediction on test
 
@@ -401,8 +419,6 @@ conf_erg <- heart_test %>%
                         type = "prob")) %>% 
   mutate(.pred_class = make_two_class_pred(`.pred_Infarkt`,
                                            levels(Herzinfarkt),
-                                           threshold = 0.53)) %>% 
+                                           threshold = .47)) %>% 
   conf_mat(estimate = .pred_class, truth = Herzinfarkt)
 sum(conf_erg$table*kosten_ertaege)
-
-
